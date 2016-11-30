@@ -17,13 +17,14 @@
 -include_lib("couch/include/couch_db.hrl").
 -include("dreyfus.hrl").
 
--export([update/2, load_docs/3]).
+-export([update/2, load_docs/2]).
 
 -import(couch_query_servers, [get_os_process/1, ret_os_process/1, proc_prompt/2]).
 
 update(IndexPid, Index) ->
     #index{
         current_seq = CurSeq,
+        purge_seq = IdxPurgeSeq,
         dbname = DbName,
         ddoc_id = DDocId,
         name = IndexName
@@ -31,6 +32,37 @@ update(IndexPid, Index) ->
     erlang:put(io_priority, {view_update, DbName, IndexName}),
     {ok, Db} = couch_db:open_int(DbName, []),
     try
+        {ok, DbPurgeSeq} = couch_db:get_purge_seq(Db),
+        if IdxPurgeSeq == DbPurgeSeq ->
+            NewPurgeSeq = IdxPurgeSeq;
+        true ->
+            {ok, DbOldestPurgeSeq} = couch_db:get_oldest_purge_seq(Db),
+
+            FoldFun = fun(PurgeSeq, {Id, Revs}, Acc) ->
+                {ok, [ {PurgeSeq, Id, Revs} | Acc]}
+            end,
+            if (IdxPurgeSeq + 1) >= DbOldestPurgeSeq ->
+                {ok, PurgeSeqIdRevs} = couch_db:fold_purged_docs(Db, IdxPurgeSeq, FoldFun, [], []),
+
+                PSeqs = lists:foldr(fun({PSeq, Id, _}, Acc) ->
+                    clouseau_rpc:delete(IndexPid, Id),
+                    clouseau_rpc:set_purge_seq(IndexPid, PSeq),
+                    [PSeq | Acc]
+                end, [], PurgeSeqIdRevs),
+
+                if PSeqs == [] ->
+                    NewPurgeSeq = IdxPurgeSeq;
+                true ->
+                    NewPurgeSeq = lists:max(PSeqs)
+                end;
+            true ->
+                %reset index
+                dreyfus_fabric_cleanup:go(DbName),
+                NewPurgeSeq = IdxPurgeSeq,
+                exit({reset, 0})
+            end
+        end,
+
         %% compute on all docs modified since we last computed.
         TotalChanges = couch_db:count_changes_since(Db, CurSeq),
 
@@ -51,20 +83,21 @@ update(IndexPid, Index) ->
         Proc = get_os_process(Index#index.def_lang),
         try
             true = proc_prompt(Proc, [<<"add_fun">>, Index#index.def]),
-            EnumFun = fun ?MODULE:load_docs/3,
+            EnumFun = fun ?MODULE:load_docs/2,
             Acc0 = {0, IndexPid, Db, Proc, TotalChanges, now()},
 
-            {ok, _, _} = couch_db:enum_docs_since(Db, CurSeq, EnumFun, Acc0, []),
+            {ok, _} = couch_db:fold_changes(Db, CurSeq, EnumFun, Acc0, []),
+
             ok = clouseau_rpc:commit(IndexPid, NewCurSeq)
         after
             ret_os_process(Proc)
         end,
-        exit({updated, NewCurSeq})
+        exit({updated, NewCurSeq, NewPurgeSeq})
     after
         couch_db:close(Db)
     end.
 
-load_docs(FDI, _, {I, IndexPid, Db, Proc, Total, LastCommitTime}=Acc) ->
+load_docs(FDI, {I, IndexPid, Db, Proc, Total, LastCommitTime}=Acc) ->
     couch_task_status:update([{changes_done, I}, {progress, (I * 100) div Total}]),
     DI = couch_doc:to_doc_info(FDI),
     #doc_info{id=Id, high_seq=Seq, revs=[#rev_info{deleted=Del}|_]} = DI,

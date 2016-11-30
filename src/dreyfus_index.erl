@@ -100,10 +100,10 @@ design_doc_to_indexes(#doc{body={Fields}}=Doc) ->
 init({DbName, Index}) ->
     process_flag(trap_exit, true),
     case open_index(DbName, Index) of
-        {ok, Pid, Seq} ->
+        {ok, Pid, Seq, PurgeSeq} ->
             State=#state{
               dbname=DbName,
-              index=Index#index{current_seq=Seq, dbname=DbName},
+              index=Index#index{current_seq=Seq, dbname=DbName, purge_seq=PurgeSeq},
               index_pid=Pid
              },
             case couch_db:open_int(DbName, []) of
@@ -160,14 +160,14 @@ handle_call(info, _From, State) -> % obsolete
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', FromPid, {updated, NewSeq}},
+handle_info({'EXIT', FromPid, {updated, NewSeq, NewPurgeSeq}},
             #state{
               index=Index0,
               index_pid=IndexPid,
               updater_pid=UpPid,
               waiting_list=WaitList
              }=State) when UpPid == FromPid ->
-    Index = Index0#index{current_seq=NewSeq},
+    Index = Index0#index{current_seq=NewSeq, purge_seq=NewPurgeSeq},
     case reply_with_index(IndexPid, Index, WaitList) of
     [] ->
         {noreply, State#state{index=Index,
@@ -181,6 +181,29 @@ handle_info({'EXIT', FromPid, {updated, NewSeq}},
                               waiting_list=StillWaiting
                              }}
     end;
+handle_info({'EXIT', Pid, {reset, NewSeq}},
+            #state{
+                updater_pid = Pid,
+                index_pid = IndexPid
+            } = State) ->
+    Index0 = State#state.index,
+    Index = Index0#index{current_seq = NewSeq},
+    NewSt = case reply_with_index(IndexPid ,Index, State#state.waiting_list) of
+                [] ->
+                    State#state{
+                        index = Index,
+                        updater_pid = undefined,
+                        waiting_list = []
+                    };
+                StillWaiting ->
+                    Pid2 = spawn_link(dreyfus_index_updater, update, [self(), Index]),
+                    State#state{
+                        index = Index,
+                        updater_pid = Pid2,
+                        waiting_list = StillWaiting
+                    }
+            end,
+    {noreply, NewSt};
 handle_info({'EXIT', _, {updated, _}}, State) ->
     {noreply, State};
 handle_info({'EXIT', FromPid, Reason}, #state{
@@ -228,9 +251,14 @@ open_index(DbName, #index{analyzer=Analyzer, sig=Sig}) ->
         {ok, Pid} ->
             case clouseau_rpc:get_update_seq(Pid) of
                 {ok, Seq} ->
-                    {ok, Pid, Seq};
-                Error ->
-                    Error
+                    case clouseau_rpc:get_purge_seq(Pid) of
+                        {ok, PurgeSeq} ->
+                            {ok, Pid, Seq, PurgeSeq};
+                        Error ->
+                            Error
+                    end;
+                 Error ->
+                     Error
             end;
         Error ->
             Error
