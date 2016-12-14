@@ -100,10 +100,10 @@ design_doc_to_indexes(#doc{body={Fields}}=Doc) ->
 init({DbName, Index}) ->
     process_flag(trap_exit, true),
     case open_index(DbName, Index) of
-        {ok, Pid, Seq, PurgeSeq} ->
+        {ok, Pid, Seq} ->
             State=#state{
               dbname=DbName,
-              index=Index#index{current_seq=Seq, dbname=DbName, purge_seq=PurgeSeq},
+              index=Index#index{current_seq=Seq, dbname=DbName},
               index_pid=Pid
              },
             case couch_db:open_int(DbName, []) of
@@ -160,50 +160,20 @@ handle_call(info, _From, State) -> % obsolete
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', FromPid, {updated, NewSeq, NewPurgeSeq}},
+handle_info({'EXIT', FromPid, {updated, NewSeq}},
             #state{
               index=Index0,
               index_pid=IndexPid,
-              updater_pid=UpPid,
-              waiting_list=WaitList
+              updater_pid=UpPid
              }=State) when UpPid == FromPid ->
-    Index = Index0#index{current_seq=NewSeq, purge_seq=NewPurgeSeq},
-    case reply_with_index(IndexPid, Index, WaitList) of
-    [] ->
-        {noreply, State#state{index=Index,
-                              updater_pid=nil,
-                              waiting_list=[]
-                             }};
-    StillWaiting ->
-        Pid = spawn_link(fun() -> dreyfus_index_updater:update(IndexPid, Index) end),
-        {noreply, State#state{index=Index,
-                              updater_pid=Pid,
-                              waiting_list=StillWaiting
-                             }}
-    end;
-handle_info({'EXIT', Pid, {reset, NewSeq}},
-            #state{
-                updater_pid = Pid,
-                index_pid = IndexPid
-            } = State) ->
-    Index0 = State#state.index,
-    Index = Index0#index{current_seq = NewSeq},
-    NewSt = case reply_with_index(IndexPid ,Index, State#state.waiting_list) of
-                [] ->
-                    State#state{
-                        index = Index,
-                        updater_pid = undefined,
-                        waiting_list = []
-                    };
-                StillWaiting ->
-                    Pid2 = spawn_link(dreyfus_index_updater, update, [self(), Index]),
-                    State#state{
-                        index = Index,
-                        updater_pid = Pid2,
-                        waiting_list = StillWaiting
-                    }
-            end,
-    {noreply, NewSt};
+    Index = Index0#index{current_seq=NewSeq},
+    NewState = reply_or_update(IndexPid, Index, State),
+    {noreply, NewState};
+handle_info({'EXIT', _Pid, reset}, State) ->
+    IndexPid = State#state.index_pid,
+    NewState1 = reset(State),
+    NewState2 = reply_or_update(IndexPid, NewState1#state.index, NewState1),
+    {noreply, NewState2};
 handle_info({'EXIT', _, {updated, _}}, State) ->
     {noreply, State};
 handle_info({'EXIT', FromPid, Reason}, #state{
@@ -245,23 +215,68 @@ code_change(_OldVsn, State, _Extra) ->
 
 % private functions.
 
-open_index(DbName, #index{analyzer=Analyzer, sig=Sig}) ->
+reply_or_update(IndexPid, Index, State) ->
+    case reply_with_index(IndexPid, Index, State#state.waiting_list) of
+        [] ->
+            State#state{
+                updater_pid=nil,
+                waiting_list=[]
+            };
+        StillWaiting ->
+            Pid = spawn_link(fun() -> dreyfus_index_updater:update(IndexPid, Index) end),
+            State#state{
+                updater_pid=Pid,
+                waiting_list=StillWaiting
+            }
+    end.
+
+reset(State) ->
+    Pid = State#state.index_pid,
+    Index = State#state.index,
+    DbName = Index#index.dbname,
+    clouseau_rpc:reset(Pid, DbName),
+    DbOldestPSeq = get_oldest_purge_seq(DbName),
+    clouseau_rpc:set_purge_seq(Pid, DbOldestPSeq),
+    case open_index(DbName, Index) of
+        {ok, _Pid, Seq} ->
+            NewIndex = Index#index{current_seq=Seq},
+            State#state{index=NewIndex};
+        Error ->
+            Error
+    end.
+
+open_index(DbName, #index{analyzer=Analyzer, sig=Sig}=Index) ->
     Path = <<DbName/binary,"/",Sig/binary>>,
     case clouseau_rpc:open_index(self(), Path, Analyzer) of
         {ok, Pid} ->
-            case clouseau_rpc:get_update_seq(Pid) of
-                {ok, Seq} ->
-                    case clouseau_rpc:get_purge_seq(Pid) of
-                        {ok, PurgeSeq} ->
-                            {ok, Pid, Seq, PurgeSeq};
-                        Error ->
-                            Error
-                    end;
-                 Error ->
-                     Error
-            end;
+            UpdateSeq = case clouseau_rpc:get_update_seq(Pid) of
+                {ok, Seq0} ->
+                    Seq0;
+                Error0 ->
+                    Error0
+            end,
+            IdxPurgeSeq = case clouseau_rpc:get_purge_seq(Pid) of
+                {ok, PurgeSeq0} -> PurgeSeq0;
+                Error1 -> Error1
+            end,
+            DbOldestPurgeSeq = get_oldest_purge_seq(DbName),
+            if (IdxPurgeSeq + 1) >= DbOldestPurgeSeq -> ok; true ->
+                clouseau_rpc:reset(Pid, DbName),
+                IdxReset = Index#index{current_seq = 0},
+                open_index(DbName, IdxReset)
+            end,
+            {ok, Pid, UpdateSeq};
         Error ->
             Error
+    end.
+
+get_oldest_purge_seq(DbName) ->
+    {ok, Db} = couch_db:open_int(DbName, []),
+    try
+        {ok, DbOldestPSeq} = couch_db:get_oldest_purge_seq(Db),
+        DbOldestPSeq
+    after
+        couch_db:close(Db)
     end.
 
 design_doc_to_index(#doc{id=Id,body={Fields}}, IndexName) ->

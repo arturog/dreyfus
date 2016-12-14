@@ -12,7 +12,6 @@
 
 -record(index, {
     current_seq=0,
-    purge_seq=0,
     dbname,
     ddoc_id,
     analyzer,

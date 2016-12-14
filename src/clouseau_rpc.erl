@@ -22,7 +22,7 @@
 -export([group1/7, group2/8, group2/2]).
 -export([delete/2, update/3, cleanup/1, cleanup/2]).
 -export([analyze/2, version/0]).
--export([set_purge_seq/2, get_purge_seq/1]).
+-export([set_purge_seq/2, get_purge_seq/1, reset/2]).
 
 open_index(Peer, Path, Analyzer) ->
     rpc({main, clouseau()}, {open, Peer, Path, Analyzer}).
@@ -83,6 +83,9 @@ cleanup(DbName) ->
 
 cleanup(DbName, ActiveSigs) ->
     gen_server:cast({cleanup, clouseau()}, {cleanup, DbName, ActiveSigs}).
+
+reset(Ref, DbName) ->
+    rpc(Ref, {reset, DbName}).
 
 analyze(Analyzer, Text) ->
     rpc({analyzer, clouseau()}, {analyze, Analyzer, Text}).

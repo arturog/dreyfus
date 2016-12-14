@@ -24,7 +24,6 @@
 update(IndexPid, Index) ->
     #index{
         current_seq = CurSeq,
-        purge_seq = IdxPurgeSeq,
         dbname = DbName,
         ddoc_id = DDocId,
         name = IndexName
@@ -32,35 +31,16 @@ update(IndexPid, Index) ->
     erlang:put(io_priority, {view_update, DbName, IndexName}),
     {ok, Db} = couch_db:open_int(DbName, []),
     try
-        {ok, DbPurgeSeq} = couch_db:get_purge_seq(Db),
-        if IdxPurgeSeq == DbPurgeSeq ->
-            NewPurgeSeq = IdxPurgeSeq;
-        true ->
-            {ok, DbOldestPurgeSeq} = couch_db:get_oldest_purge_seq(Db),
-
-            FoldFun = fun(PurgeSeq, {Id, Revs}, Acc) ->
-                {ok, [ {PurgeSeq, Id, Revs} | Acc]}
-            end,
-            if (IdxPurgeSeq + 1) >= DbOldestPurgeSeq ->
-                {ok, PurgeSeqIdRevs} = couch_db:fold_purged_docs(Db, IdxPurgeSeq, FoldFun, [], []),
-
-                PSeqs = lists:foldr(fun({PSeq, Id, _}, Acc) ->
-                    clouseau_rpc:delete(IndexPid, Id),
-                    clouseau_rpc:set_purge_seq(IndexPid, PSeq),
-                    [PSeq | Acc]
-                end, [], PurgeSeqIdRevs),
-
-                if PSeqs == [] ->
-                    NewPurgeSeq = IdxPurgeSeq;
-                true ->
-                    NewPurgeSeq = lists:max(PSeqs)
-                end;
-            true ->
-                %reset index
-                dreyfus_fabric_cleanup:go(DbName),
-                NewPurgeSeq = IdxPurgeSeq,
-                exit({reset, 0})
-            end
+        {ok, IdxPurgeSeq} = clouseau_rpc:get_purge_seq(IndexPid),
+        FoldFun = fun(PurgeSeq, {Id, _Revs}, Acc) ->
+            clouseau_rpc:delete(IndexPid, Id),
+            clouseau_rpc:set_purge_seq(IndexPid, PurgeSeq),
+            {ok, Acc}
+        end,
+        try
+            couch_db:fold_purged_docs(Db, IdxPurgeSeq, FoldFun, nil, []) %Db, StartPurgeSeq, UserFun, UserAcc, Opts
+        catch throw:{invalid_start_purge_seq, _}  ->
+            exit(reset)
         end,
 
         %% compute on all docs modified since we last computed.
@@ -92,7 +72,7 @@ update(IndexPid, Index) ->
         after
             ret_os_process(Proc)
         end,
-        exit({updated, NewCurSeq, NewPurgeSeq})
+        exit({updated, NewCurSeq})
     after
         couch_db:close(Db)
     end.
